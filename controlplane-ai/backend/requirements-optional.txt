@@ -1,0 +1,10 @@
+# Optional production infrastructure — NOT required to run the demo.
+# Install these only if you're wiring up the corresponding backend:
+#   - psycopg2-binary: set DATABASE_URL to a postgres:// URL instead of SQLite
+#   - redis: back SessionStore (backend/app/session/context.py) with Redis
+#     instead of the in-process dict (required for multi-instance deployment)
+#   - chromadb: point VECTOR_DB_URL at a running Chroma server for real
+#     embedding-based retrieval instead of the local keyword-matched doc store
+psycopg2-binary
+redis
+chromadb
