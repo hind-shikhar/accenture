@@ -1,6 +1,6 @@
 # ControlPlane.ai
 
-> **Accenture Innovation Challenge 2026 — Round 2**
+> **Accenture Innovation Challenge 2026**
 > An enterprise-grade, model-agnostic AI Governance Middleware built on LangGraph.
 
 **🎥 Demo Video:** [Watch the walkthrough](https://drive.google.com/file/d/1t4-ZC3IXH8LWsjHGLSI8SftOSyELeahk/view?usp=drive_link)
