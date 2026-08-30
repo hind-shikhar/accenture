@@ -3,7 +3,7 @@
 > **Accenture Innovation Challenge 2026 — Round 2**
 > An enterprise-grade, model-agnostic AI Governance Middleware built on LangGraph.
 
-**🎥 Demo Video:** [Watch the walkthrough](ADD_DEMO_VIDEO_LINK_HERE) <!-- TODO: replace with the uploaded video link before submitting -->
+**🎥 Demo Video:** [Watch the walkthrough](https://drive.google.com/file/d/1t4-ZC3IXH8LWsjHGLSI8SftOSyELeahk/view?usp=drive_link)
 
 ---
 
@@ -18,6 +18,7 @@
 - [Running the Project](#running-the-project-no-docker-required)
 - [Demo Mode](#demo-mode)
 - [Project Structure](#project-structure)
+- [Future Additions / Roadmap](#future-additions--roadmap)
 - [Further Documentation](#further-documentation)
 
 ---
@@ -62,8 +63,8 @@ User Prompt
 │                                                                 │
 │  [Security Gate]──►[Session Risk]──►[Semantic Router]──►[LLM]  │
 │       │                                                    │    │
-│   Presidio ML                              ┌───────────────┤    │
-│   PII + Injection                          │   Parallel    │    │
+│   Presidio ML + DeBERTa v3                 ┌───────────────┤    │
+│   PII + Injection (regex ⊔ ML)             │   Parallel    │    │
 │                                            │   Detection   │    │
 │                              ┌─────────────▼─────────────┐│    │
 │                              │  PII in Response           ││    │
@@ -101,6 +102,8 @@ Governance Audit Log + Auto-Threshold Tuner
 | **BART Zero-Shot Bias Classifier** | `facebook/bart-large-mnli` classifies gender, racial, political, age & socioeconomic bias |
 | **DistilBERT Safety Scorer** | HuggingFace sentiment pipeline as a toxicity/safety proxy |
 | **Retrieval-Based Hallucination Verification** | Claims cross-referenced against a local enterprise document store |
+| **ML Prompt-Injection Classifier** | `protectai/deberta-v3-base-prompt-injection-v2` fused (via `max()`) with the regex pattern families, on both the incoming prompt and the outgoing response — catches injection attempts regex alone misses, without ever downgrading a regex hit |
+| **AI-Judge Calibration Harness** | `scripts/calibrate_judge.py` scores the AI-as-Judge detector against a golden dataset (verdict accuracy, per-class precision/recall/f1, and whether `judge_confidence` actually tracks correctness) — plus `scripts/export_reviewed_examples.py` to grow that dataset from real HITL review decisions over time |
 | **Evidence Fusion Engine** | 7 parallel detectors → weighted composite risk score → single governance decision |
 | **Policy-Aware Routing** | Per use-case, per-geography thresholds (EU GDPR vs. US vs. Global) |
 | **Human-in-the-Loop (HITL)** | LangGraph `interrupt()` → approve/reject/edit/regenerate from dashboard |
@@ -127,9 +130,9 @@ Governance Audit Log + Auto-Threshold Tuner
 |---|---|
 | **Orchestration** | LangGraph v1.2 (StateGraph with parallel fan-out) |
 | **Backend** | FastAPI + SQLAlchemy + SQLite |
-| **ML Models** | Presidio (spaCy), HuggingFace Transformers (DistilBERT, BART) |
+| **ML Models** | Presidio (spaCy) for PII, HuggingFace Transformers — DistilBERT (safety proxy), BART zero-shot (bias), DeBERTa v3 (prompt-injection) |
 | **Frontend** | React 19, Vite, Tailwind CSS v4, Recharts, Lucide |
-| **Testing** | Pytest (19 tests) |
+| **Testing** | Pytest (69 tests) |
 
 ---
 
@@ -139,7 +142,7 @@ Governance Audit Log + Auto-Threshold Tuner
 - **API layer:** FastAPI, Uvicorn, Pydantic / Pydantic-Settings
 - **Orchestration:** LangGraph, LangGraph-checkpoint(-sqlite), LangChain-core, LiteLLM
 - **Persistence:** SQLAlchemy + aiosqlite (SQLite)
-- **ML detectors:** Presidio (analyzer + anonymizer) + spaCy `en_core_web_sm` for PII/NER; PyTorch + Transformers for DistilBERT (hallucination/safety) and BART zero-shot (bias)
+- **ML detectors:** Presidio (analyzer + anonymizer) + spaCy `en_core_web_sm` for PII/NER; PyTorch + Transformers for DistilBERT (hallucination/safety), BART zero-shot (bias), and DeBERTa v3 (`protectai/deberta-v3-base-prompt-injection-v2`) for prompt injection — all three Transformer models load in a background thread at startup and never block a request
 - **Observability:** structlog, OpenTelemetry (API + SDK + FastAPI instrumentation)
 - **Rate limiting:** slowapi
 - **Testing:** pytest, pytest-asyncio, httpx
@@ -151,6 +154,13 @@ Governance Audit Log + Auto-Threshold Tuner
 - lucide-react, clsx, tailwind-merge for UI utilities
 
 **External model APIs (optional):** an `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY` are only required if `DEMO_MODE=false` — the default demo configuration uses a local mock provider and needs no paid API access.
+
+**Production infrastructure (optional)** — pinned in [`backend/requirements-optional.txt`](backend/requirements-optional.txt), none required for the demo:
+- `psycopg2-binary` + `asyncpg` — swap SQLite for Postgres (`DATABASE_URL`)
+- `redis` — back multi-instance session/HITL-escalation state instead of the in-process dict (`REDIS_URL`)
+- `langgraph-checkpoint-postgres` — share paused-HITL checkpoint state across replicas instead of a local SQLite file (`CHECKPOINT_BACKEND=postgres`)
+- `chromadb` — real embedding-based retrieval instead of the local keyword-matched doc store
+- `opentelemetry-exporter-otlp-proto-grpc` — export traces to a real collector instead of the console
 
 ---
 
@@ -208,7 +218,7 @@ python -m pytest backend/tests/ -v
 The application runs in `DEMO_MODE=true` (default). This means:
 - All AI responses come from a local mock provider with 12 realistic enterprise canned responses
 - No paid API keys required
-- ML models run locally: Presidio, DistilBERT, BART zero-shot
+- ML models run locally: Presidio, DistilBERT, BART zero-shot, DeBERTa v3 (prompt-injection)
 
 To use a real LLM, set `DEMO_MODE=false` in `.env` and provide your `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`.
 
@@ -221,9 +231,10 @@ controlplane-ai/
 ├── backend/
 │   └── app/
 │       ├── api/          # FastAPI routes (chat, dashboard, metrics)
-│       ├── evaluation/   # Evidence fusion, evaluator, AI judge, retrieval verifier, threshold tuner
-│       ├── security/     # Presidio ML scanner
-│       ├── workflows/    # LangGraph state graph (14 nodes)
+│       ├── evaluation/   # Evidence fusion, evaluator, AI judge, retrieval verifier,
+│       │                 # threshold tuner, judge calibration + golden dataset
+│       ├── security/     # Presidio ML scanner + injection pattern families
+│       ├── workflows/    # LangGraph state graph (DeBERTa injection classifier lives here)
 │       ├── policies/     # Per use-case, per-geography policy registry
 │       ├── routing/      # Semantic router
 │       ├── session/      # Session risk tracking
@@ -231,13 +242,35 @@ controlplane-ai/
 ├── frontend/
 │   └── src/
 │       ├── Dashboard.tsx # Governance dashboard with charts
-│       └── Tester.tsx    # Interactive policy tester
+│       ├── Tester.tsx    # Interactive policy tester
+│       └── ui.tsx        # Shared UI primitives (panels, section labels, form controls)
 ├── scripts/
 │   ├── run_demo.py       # E2E 5-scenario demo
-│   ├── seed_demo.py      # Populate dashboard with demo data
-│   └── interactive.py    # Interactive CLI tester
-└── backend/tests/        # 19 Pytest unit tests
+│   ├── seed_demo_data.py # Populate dashboard with demo data
+│   ├── interactive.py    # Interactive CLI tester
+│   ├── calibrate_judge.py           # AI-Judge accuracy/calibration report vs. golden dataset
+│   └── export_reviewed_examples.py  # Grow the golden dataset from real HITL decisions
+└── backend/tests/        # 69 Pytest unit tests (AI judge, judge calibration, ML injection classifier, etc.)
 ```
+
+---
+
+## Future Additions / Roadmap
+
+ControlPlane.ai is designed to scale with enterprise needs. Round 2 already replaced one detector's generic ML fallback with a purpose-built model — the prompt-injection classifier now runs `protectai/deberta-v3-base-prompt-injection-v2` fused with the regex pattern families, and the AI-as-Judge detector has its own calibration harness (`scripts/calibrate_judge.py`) to measure accuracy against a golden dataset before it's trusted to gate real decisions. The same pattern — a specialized model per detection task, measured against labeled data before it's trusted — is the direction for the rest of the pipeline:
+
+1. **Dedicated, fine-tuned models per detection task.** Each of the remaining generic ML fallbacks gets replaced with a small model fine-tuned for its specific job, the same way prompt-injection detection already moved off pure regex:
+   - **Hallucination/factuality** — replace DistilBERT's sentiment-as-safety-proxy with a claim-verification model (e.g. a fine-tuned NLI/entailment model) trained on enterprise-domain text, instead of leaning on retrieval-verifier + AI-judge agreement alone.
+   - **Bias/fairness** — fine-tune BART's zero-shot classifier (or a smaller distilled model) on labeled examples from this domain, rather than relying on generic zero-shot labels for gender/racial/political/socioeconomic bias.
+   - **Toxicity/safety** — swap the DistilBERT sentiment proxy for a model actually trained for toxicity/harassment classification.
+   - **PII** — extend Presidio's spaCy NER with a fine-tuned NER model for entity types and locales the default `en_core_web_sm` model misses (non-English names/addresses, industry-specific identifiers).
+   - Each rollout follows the injection classifier's playbook: load in a background thread so it never blocks a request, fuse (never replace) the existing signal, and fall back cleanly if the model isn't ready.
+2. **AI-Judge calibration against real data.** `backend/app/evaluation/golden_dataset.py` is currently a small synthetic starter set. `scripts/export_reviewed_examples.py` already exists to turn real HITL approve/reject decisions into golden examples — the roadmap item is running that pipeline continuously in production and using the resulting accuracy/calibration numbers to decide when `judge_confidence` is trustworthy enough to gate REVIEW/BLOCK decisions autonomously.
+3. **Embedding-based retrieval.** Move hallucination verification off the local keyword-matched document store and onto real vector search (`chromadb` is already an optional dependency) for semantically-aware — not just keyword-aware — claim verification against enterprise documents.
+4. **Semantic Caching & Fast-Pathing:** Cache verified-safe responses for identical or semantically similar queries to cut LLM cost and latency.
+5. **Enterprise IAM & RBAC Integration:** Connect the dashboard and HITL queue to enterprise identity providers (OAuth/SAML) for strict role-based access control.
+6. **Multi-Modal Governance Expansion:** Extend the Security Gate to scan and sanitize image and audio inputs/outputs for PII, compliance, and NSFW content.
+7. **Real-time Streaming Governance:** Emit chunked token streams to the end user while governance checks run in parallel, revoking the stream mid-flight if a violation is detected.
 
 ---
 

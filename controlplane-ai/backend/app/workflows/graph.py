@@ -18,8 +18,12 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 # in-flight graph state) survives a server restart — MemorySaver loses all
 # of that on process exit, silently orphaning any audit row still marked
 # human_review_status="pending". Tests force CHECKPOINT_BACKEND=memory via
-# conftest.py for isolation and speed; a real Postgres-backed checkpointer
-# is the next step for a multi-instance deployment.
+# conftest.py for isolation and speed. CHECKPOINT_BACKEND=postgres is the
+# path for a multi-instance deployment (SQLite-file state can't be shared
+# across replicas) — see init_persistent_checkpointer below. It requires the
+# optional langgraph-checkpoint-postgres + asyncpg packages (requirements-
+# optional.txt) and a running Postgres instance; neither is exercised by
+# default, so this never affects the SQLite/memory paths when unconfigured.
 #
 # NOTE: the sync SqliteSaver's aget/aput raise NotImplementedError in this
 # langgraph-checkpoint-sqlite version — the async graph needs AsyncSqliteSaver
@@ -32,23 +36,46 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 # event below, compiled in with a MemorySaver placeholder until then.
 checkpointer = MemorySaver()
 _sqlite_checkpoint_conn = None
+_postgres_checkpointer_cm = None  # holds the AsyncPostgresSaver context manager open for process lifetime
 
 
 async def init_persistent_checkpointer():
-    """Swap in the SQLite-backed checkpointer. Must be awaited from the
-    event loop that will actually serve requests (e.g. FastAPI startup)."""
-    global _sqlite_checkpoint_conn
-    if os.getenv("CHECKPOINT_BACKEND", "sqlite") == "memory":
+    """Swap in a persistent checkpointer. Must be awaited from the event
+    loop that will actually serve requests (e.g. FastAPI startup)."""
+    global _sqlite_checkpoint_conn, _postgres_checkpointer_cm
+    backend_kind = os.getenv("CHECKPOINT_BACKEND", "sqlite")
+    if backend_kind == "memory":
         return
+
+    if backend_kind == "postgres":
+        pg_conn_str = os.getenv("CHECKPOINT_DB_URL")
+        if not pg_conn_str:
+            logger.error("checkpoint_backend_postgres_missing_url",
+                         detail="CHECKPOINT_BACKEND=postgres requires CHECKPOINT_DB_URL — falling back to SQLite")
+        else:
+            try:
+                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+                _postgres_checkpointer_cm = AsyncPostgresSaver.from_conn_string(pg_conn_str)
+                saver = await _postgres_checkpointer_cm.__aenter__()
+                await saver.setup()
+                app_graph.checkpointer = saver
+                logger.info("persistent_checkpointer_initialized", backend="postgres")
+                return
+            except ImportError:
+                logger.error("checkpoint_backend_postgres_not_installed",
+                             detail="pip install langgraph-checkpoint-postgres asyncpg — falling back to SQLite")
+            except Exception as e:
+                logger.error("checkpoint_backend_postgres_init_failed", error=str(e), fallback="sqlite")
+
     db_path = os.getenv("CHECKPOINT_DB_PATH", "langgraph_state.db")
     _sqlite_checkpoint_conn = await aiosqlite.connect(db_path)
     saver = AsyncSqliteSaver(_sqlite_checkpoint_conn)
     await saver.setup()
     app_graph.checkpointer = saver
-    logger.info("persistent_checkpointer_initialized", db_path=db_path)
+    logger.info("persistent_checkpointer_initialized", backend="sqlite", db_path=db_path)
 
 from backend.app.security.scanner import SecurityScanner
-from backend.app.security.injection_patterns import score_injection
+from backend.app.security.injection_patterns import score_injection, score_injection_session
 from backend.app.routing.router import SemanticRouter
 from backend.app.providers.factory import ProviderFactory
 from backend.app.evaluation.evaluator import ResponseEvaluator
@@ -107,6 +134,79 @@ def _load_bias_classifier_background():
         _bias_ready.set()  # Signal ready so we don't re-attempt per request
 
 
+# ─── ML Model: Prompt-Injection Classifier ───────────────────────────────────
+# Loaded in a background thread at startup (main.py), same convention as the
+# bias classifier above. score_injection() (injection_patterns.py) only ever
+# catches phrasing inside its named pattern families — this trained
+# classifier is a second, independent signal that can catch paraphrases
+# outside those families. It is fused via max() with the regex score in
+# node_security / node_detect_injection_in_response, never a replacement —
+# same defense-in-depth reasoning as everywhere else in this pipeline: no
+# single detector is trusted as the sole source of a BLOCK.
+_injection_classifier = None
+_injection_ready = _threading.Event()
+
+
+def _get_injection_classifier():
+    """Returns the classifier only if already loaded. Never blocks."""
+    return _injection_classifier if _injection_ready.is_set() else None
+
+
+def _load_injection_classifier_background():
+    """
+    Called from main.py startup in a daemon thread.
+    Downloads and loads protectai/deberta-v3-base-prompt-injection-v2 once,
+    then signals ready.
+    """
+    global _injection_classifier
+    try:
+        from transformers import pipeline
+        logger.info("Loading prompt-injection classifier (protectai/deberta-v3-base-prompt-injection-v2)...")
+        clf = pipeline(
+            "text-classification",
+            model="protectai/deberta-v3-base-prompt-injection-v2",
+            device=-1  # CPU
+        )
+        _injection_classifier = clf
+        _injection_ready.set()
+        logger.info("Injection classifier loaded and ready.")
+    except Exception as e:
+        logger.warning(f"Injection classifier load failed: {e}. Regex-only scoring will be used.")
+        _injection_classifier = "fallback"
+        _injection_ready.set()  # Signal ready so we don't re-attempt per request
+
+
+async def _ml_injection_score(text: str, latency_tier: str) -> "tuple[float, bool]":
+    """Returns (score, ml_used). Never blocks past the tier's ML timeout
+    budget, and never raises — any failure just means the regex score
+    stands alone, the same fail-open posture as the bias classifier."""
+    if latency_tier == "realtime" or not _injection_ready.is_set() \
+            or _injection_classifier in (None, "fallback") or not text.strip():
+        return 0.0, False
+    try:
+        trunc = text[:2000]
+        loop = asyncio.get_event_loop()
+        timeout_s = TIER_ML_TIMEOUT_MS.get(latency_tier, 1200) / 1000
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: _injection_classifier(trunc, truncation=True)[0]),
+            timeout=timeout_s,
+        )
+        label = str(result.get("label", "")).upper()
+        confidence = float(result.get("score", 0.0))
+        # Label text varies by model version ("INJECTION" vs "SAFE" etc.) —
+        # treat confidence as an injection score only when the label itself
+        # says so, otherwise it's confidence in SAFETY and the injection
+        # score is its complement.
+        ml_score = confidence if "INJECT" in label or "UNSAFE" in label else (1.0 - confidence)
+        return round(ml_score, 3), True
+    except asyncio.TimeoutError:
+        logger.warning("injection_ml_timeout", latency_tier=latency_tier, budget_ms=TIER_ML_TIMEOUT_MS.get(latency_tier))
+        return 0.0, False
+    except Exception as e:
+        logger.warning(f"Injection ML inference error: {e}")
+        return 0.0, False
+
+
 # Instances
 scanner = SecurityScanner()
 semantic_router = SemanticRouter()
@@ -146,6 +246,7 @@ class ControlPlaneState(TypedDict):
     selected_provider: str
     selected_model: str
     llm_response: str
+    generation_model_resolved: str
 
     # Parallel evidence collection (reducer ensures safe merging)
     evidence: Annotated[List[Dict[str, Any]], merge_evidence]
@@ -180,13 +281,42 @@ async def node_security(state: ControlPlaneState):
     sec_dict = res.model_dump()
     sec_dict["masked_text"] = masked
     sec_dict["source"] = "security_scan"
+
+    # Catches instruction-smuggling split across turns (e.g. "...ignore all"
+    # in one message, "previous instructions..." in the next), which the
+    # single-message scan above can't see. session_store already holds
+    # prior turns' prompts by the time this request arrives — add_turn() for
+    # THIS request only happens after the graph completes (api/chat.py).
+    session_id = state.get("session_id")
+    if session_id:
+        session = await session_store.get(session_id)
+        if session:
+            recent_prompts = [t.prompt for t in session.turns[-4:]]
+            cross_turn_score, cross_turn_categories = score_injection_session(state["prompt"], recent_prompts)
+            if cross_turn_score > 0:
+                sec_dict["cross_turn_injection_score"] = cross_turn_score
+                sec_dict["cross_turn_injection_categories"] = cross_turn_categories
+                sec_dict["prompt_injection_score"] = max(sec_dict["prompt_injection_score"], cross_turn_score)
+                sec_dict["allowed"] = sec_dict["prompt_injection_score"] < 0.7
+                logger.warning("cross_turn_injection_detected", session_id=session_id,
+                                categories=cross_turn_categories, score=cross_turn_score)
+
+    # Second, independent signal beyond the regex pattern families — see
+    # _ml_injection_score above. Fused via max(), never a replacement.
+    policy = policy_registry.get_policy(state.get("use_case", "internal_copilot"), state.get("geography", "global"))
+    ml_score, ml_used = await _ml_injection_score(state["prompt"], policy.latency_tier)
+    if ml_used:
+        sec_dict["ml_injection_score"] = ml_score
+        sec_dict["prompt_injection_score"] = max(sec_dict["prompt_injection_score"], ml_score)
+        sec_dict["allowed"] = sec_dict["prompt_injection_score"] < 0.7
+
     latency = (time.time() - t0) * 1000
     return {
         "masked_prompt": masked,
         "security_result": sec_dict,
         "evidence": [sec_dict],
         "detector_latencies": {"security_scan": round(latency, 2)},
-        "detector_costs": {"security_scan": pricing.estimate_detector_cost("security_scan")}
+        "detector_costs": {"security_scan": pricing.estimate_detector_cost("security_scan", ml_used=ml_used)}
     }
 
 
@@ -216,8 +346,8 @@ async def node_session_check(state: ControlPlaneState):
     use_case = state.get("use_case", "internal_copilot")
     geography = state.get("geography", "global")
     policy = policy_registry.get_policy(use_case, geography)
-    session = session_store.get_or_create(session_id, use_case, policy.session_escalation_thresholds)
-    drift = session_store.get_drift_score(session_id)
+    session = await session_store.get_or_create(session_id, use_case, policy.session_escalation_thresholds)
+    drift = await session_store.get_drift_score(session_id)
 
     return {
         "session_escalation": session.escalation_level,
@@ -265,6 +395,7 @@ async def node_llm(state: ControlPlaneState):
         )
         return {
             "llm_response": response_text,
+            "generation_model_resolved": model_response.get("model"),
             "detector_latencies": {"llm": round(latency, 2)},
             "detector_costs": {"llm": llm_cost}
         }
@@ -417,11 +548,30 @@ async def node_ai_judge(state: ControlPlaneState):
     session_id = state.get("session_id")
     history = []
     if session_id:
-        session = session_store.get(session_id)
+        session = await session_store.get(session_id)
         if session:
             history = session.get_history()
 
-    ev = await ai_judge.evaluate(state.get("masked_prompt", ""), state.get("llm_response", ""), history)
+    # AIJudge's own internal timeout (LIVE_JUDGE_TIMEOUT_S, ai_judge.py) is a
+    # flat 8s regardless of use-case tier — far beyond a realtime tier's
+    # whole request budget (e.g. 300ms). Enforce the same per-tier ceiling
+    # every other ML-backed node in this graph respects, so a slow/borderline
+    # live judge call can never blow a realtime SLA; falls back to a
+    # conservative UNCERTAIN verdict on timeout rather than stalling.
+    timeout_s = TIER_ML_TIMEOUT_MS.get(policy.latency_tier, 1200) / 1000
+    try:
+        ev = await asyncio.wait_for(
+            ai_judge.evaluate(
+                state.get("masked_prompt", ""), state.get("llm_response", ""), history,
+                generation_model=state.get("generation_model_resolved"),
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("ai_judge_node_timeout", tier=policy.latency_tier, budget_ms=TIER_ML_TIMEOUT_MS.get(policy.latency_tier))
+        ev = {"source": "ai_judge", "judge_confidence": 0.7, "claim_verdict": "UNCERTAIN",
+              "bias_score": 0.0, "consistency_score": 0.7, "unsupported_claims": [],
+              "method": "timeout_fallback", "timed_out": True}
     latency = (time.time() - t0) * 1000
     ev["latency_ms"] = round(latency, 2)
     return {
@@ -436,12 +586,19 @@ async def node_detect_injection_in_response(state: ControlPlaneState):
     t0 = time.time()
     response = state.get("llm_response", "")
     score, categories = score_injection(response)
+
+    policy = policy_registry.get_policy(state.get("use_case", "internal_copilot"), state.get("geography", "global"))
+    ml_score, ml_used = await _ml_injection_score(response, policy.latency_tier)
+    if ml_used:
+        score = max(score, ml_score)
+
     latency = (time.time() - t0) * 1000
-    ev = {"source": "injection", "injection_score": round(score, 3), "categories": categories}
+    ev = {"source": "injection", "injection_score": round(score, 3), "categories": categories,
+          "ml_injection_score": ml_score if ml_used else None, "ml_used": ml_used}
     return {
         "evidence": [ev],
         "detector_latencies": {"injection": round(latency, 2)},
-        "detector_costs": {"injection": pricing.estimate_detector_cost("injection")}
+        "detector_costs": {"injection": pricing.estimate_detector_cost("injection", ml_used=ml_used)}
     }
 
 
@@ -465,7 +622,8 @@ async def node_evidence_fusion(state: ControlPlaneState):
         "verification_status": assessment.verification_status.value,
         "decision": assessment.decision.value,
         "reasons": assessment.reasons,
-        "sanitized_response": assessment.sanitized_response
+        "sanitized_response": assessment.sanitized_response,
+        "risk_vectors": {k: float(v) for k, v in assessment.risk_vectors.items()},
     }
 
 

@@ -1,13 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 import json, asyncio
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 import uuid, time, structlog
 
 from backend.app.schemas.chat import ChatRequest, ChatResponse, Decision, VerificationStatus
 from backend.app.db.database import get_db
 from backend.app.db.models import AuditLog
-from backend.app.workflows.graph import app_graph, ControlPlaneState
+from backend.app.workflows.graph import app_graph, ControlPlaneState, semantic_router
 from backend.app.session.context import session_store
 from backend.app.evaluation.action_gate import action_gate
 from backend.app.db.models import AgentActionLog
@@ -51,7 +51,7 @@ async def chat_stream(request: Request, chat_req: ChatRequest):
 
 @router.post("/chat", response_model=ChatResponse)
 @limiter.limit("30/minute")
-async def chat_endpoint(request: Request, chat_req: ChatRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+async def chat_endpoint(request: Request, chat_req: ChatRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
     start_time = time.time()
     trace_id = str(uuid.uuid4())
     session_id = chat_req.session_id or str(uuid.uuid4())
@@ -101,9 +101,19 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest, background_task
 
     # Cost & latency-budget accounting
     detector_costs = final_state.get("detector_costs", {})
+    detector_latencies = final_state.get("detector_latencies", {})
     cost_usd = round(sum(detector_costs.values()), 6)
     policy = policy_registry.get_policy(initial_state["use_case"], initial_state["geography"])
     latency_budget_met = latency <= policy.max_latency_ms
+
+    # Feed this request's real LLM cost/latency back into the router so
+    # future estimated_cost/estimated_latency for this model tier reflect
+    # actual observed traffic instead of the static catalog in router.py.
+    selected_model = final_state.get("selected_model")
+    if selected_model:
+        semantic_router.record_observed_stats(
+            selected_model, detector_costs.get("llm"), detector_latencies.get("llm")
+        )
 
     # Update session
     security_res = final_state.get("security_result", {})
@@ -111,8 +121,9 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest, background_task
     risk_delta = (100 - trust_score) * 0.5 + injection_score * 30
     use_case_str = initial_state["use_case"]
 
-    session = session_store.get_or_create(session_id, use_case_str)
+    session = await session_store.get_or_create(session_id, use_case_str)
     session.add_turn(chat_req.prompt, final_output or "", risk_delta)
+    await session_store.commit(session)
 
     # Extract evaluation result from evidence for the frontend dashboard
     evidence_list = final_state.get("evidence", [])
@@ -131,7 +142,7 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest, background_task
     # the pipeline just redacted from reaching the LLM (see threat-model.md §7).
     masked_prompt_for_audit = final_state.get("masked_prompt", chat_req.prompt)
 
-    def log_audit():
+    async def log_audit():
         log_entry = AuditLog(
             id=trace_id,
             prompt=masked_prompt_for_audit,
@@ -149,7 +160,7 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest, background_task
             evaluation_result=eval_result,
             composite_risk={"overlapping_risks": overlapping_risks,
                             "primary_risk": final_state.get("primary_risk_category", "NONE"),
-                            "risk_vectors": {e.get("source"): e for e in evidence_list}},
+                            "risk_vectors": final_state.get("risk_vectors", {})},
             trust_score=trust_score,
             risk_level=risk_level,
             decision=decision_str,
@@ -166,7 +177,7 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest, background_task
             human_review_status="pending" if is_paused else ("blocked" if decision_str == "BLOCK" else "na")
         )
         db.add(log_entry)
-        db.commit()
+        await db.commit()
 
     is_blocked = decision_str == "BLOCK" and not is_paused
     if is_blocked:
@@ -174,8 +185,9 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest, background_task
         # so a task queued via BackgroundTasks (which only runs after a
         # successful return) would silently never fire — blocked requests are
         # exactly the ones a compliance audit trail can't afford to lose, so
-        # write synchronously here instead of deferring.
-        log_audit()
+        # write before raising instead of deferring. Awaited directly (not a
+        # blocking sync call) so this doesn't stall the event loop either.
+        await log_audit()
     else:
         background_tasks.add_task(log_audit)
 
@@ -218,7 +230,7 @@ async def chat_endpoint(request: Request, chat_req: ChatRequest, background_task
 
 @router.post("/agent-action")
 @limiter.limit("30/minute")
-async def evaluate_agent_action(request: Request, payload: dict, db: Session = Depends(get_db)):
+async def evaluate_agent_action(request: Request, payload: dict, db: AsyncSession = Depends(get_db)):
     """Evaluate a proposed agent action through the Action Risk Gate."""
     action_type = payload.get("action_type", "")
     use_case = payload.get("use_case", "internal_copilot")
@@ -227,7 +239,7 @@ async def evaluate_agent_action(request: Request, payload: dict, db: Session = D
 
     session_risk = 0.0
     if session_id:
-        session = session_store.get(session_id)
+        session = await session_store.get(session_id)
         if session:
             session_risk = session.cumulative_risk
 
@@ -246,7 +258,7 @@ async def evaluate_agent_action(request: Request, payload: dict, db: Session = D
         use_case=use_case
     )
     db.add(log)
-    db.commit()
+    await db.commit()
 
     if result["decision"] == "BLOCK":
         return {**result, "message": "Action BLOCKED by ControlPlane Action Gate. HITL required."}

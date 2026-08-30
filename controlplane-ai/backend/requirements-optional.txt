@@ -1,10 +1,24 @@
 # Optional production infrastructure — NOT required to run the demo.
 # Install these only if you're wiring up the corresponding backend:
-#   - psycopg2-binary: set DATABASE_URL to a postgres:// URL instead of SQLite
+#   - psycopg2-binary + asyncpg: set DATABASE_URL to a postgres:// URL instead
+#     of SQLite (backend/app/db/database.py auto-selects the asyncpg driver
+#     for request-time async queries; psycopg2-binary backs the sync engine
+#     used only for one-time startup schema creation/migration)
 #   - redis: back SessionStore (backend/app/session/context.py) with Redis
-#     instead of the in-process dict (required for multi-instance deployment)
+#     instead of the in-process dict (required for multi-instance deployment) —
+#     set REDIS_URL to enable
+#   - langgraph-checkpoint-postgres + (asyncpg, already listed above): set
+#     CHECKPOINT_BACKEND=postgres and CHECKPOINT_DB_URL to persist LangGraph/
+#     HITL state in Postgres instead of a local SQLite file (required for a
+#     multi-instance deployment — SQLite-file checkpoint state can't be
+#     shared across replicas)
 #   - chromadb: point VECTOR_DB_URL at a running Chroma server for real
 #     embedding-based retrieval instead of the local keyword-matched doc store
+#   - opentelemetry-exporter-otlp-proto-grpc: set OTEL_EXPORTER_OTLP_ENDPOINT
+#     to export real traces to a collector instead of the console
 psycopg2-binary
+asyncpg
 redis
+langgraph-checkpoint-postgres
 chromadb
+opentelemetry-exporter-otlp-proto-grpc

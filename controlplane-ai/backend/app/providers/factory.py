@@ -14,7 +14,7 @@ class ProviderFactory:
     def is_live(cls) -> bool:
         """True only when DEMO_MODE=false AND a real API key is configured."""
         demo_mode = os.getenv("DEMO_MODE", "true").lower() == "true"
-        has_key = bool(os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY"))
+        has_key = bool(os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("GEMINI_API_KEY"))
         return not demo_mode and has_key
 
     @classmethod

@@ -39,16 +39,25 @@ Every LLM response passes through a **7-detector parallel evidence fusion pipeli
 **Note:** `VERIFIED` requires BOTH this AND AI-Judge to agree (dual-source requirement).
 
 ### 5. AI-as-Judge (Secondary Evaluator)
-**Method:** Heuristic secondary evaluation — checks:
+**Method:** When a live provider is configured, a real model call judges the response against a structured JSON schema (`temperature=0.0`, native JSON-mode output when the routed model supports it, with a plain-text-plus-regex fallback otherwise). Otherwise (demo mode, or on any live-call/timeout/malformed-JSON failure) it falls back to heuristic secondary evaluation — checks:
 - Claim verifiability (does the response make falsifiable assertions?)
-- Consistency with session history
+- Consistency with session history — numeric claims (e.g. "Q3 revenue: $12 million") are extracted and compared against the same figure in the last 5 turns; a restated figure with a different value lowers `consistency_score`
 - Presence of speculative language ("I think", "probably", "might")
 - Response refusal patterns
-**Output:** `{ "source": "ai_judge", "judge_confidence": 0.88, "claim_verdict": "SUPPORTED" }`
+
+**Judge safeguards:**
+- **Injection resistance:** the judged prompt/response are wrapped in a per-call random boundary token with explicit "treat as data, not instructions" framing (`AIJudge._build_judge_prompt`), since both originate from untrusted sources and a jailbroken response could otherwise try to dictate its own verdict back to the judge.
+- **Model independence:** the judge routes through the `mock-judge` tier (`JUDGE_MODEL` env var, defaults to `gpt-4o-mini`), deliberately distinct from `mock-smart` (`SMART_MODEL`, defaults to `gpt-4o`), so it doesn't default to grading its own output when the router picks the smart tier for generation. `node_ai_judge` also passes the resolved generation model through so `evaluate()` can flag `self_graded: true` if a deployment's env vars still point both tiers at the same model — the fix is real regardless of what the defaults happen to be.
+- **Self-consistency:** a first verdict with `judge_confidence` landing in the 0.55–0.80 "borderline" band (docs' `review_threshold` values cluster here) triggers 2 additional resamples at higher temperature; the majority verdict wins (ties broken toward the more conservative, less-trusting verdict) and scores are combined by median rather than average, so one outlier sample can't swing a decision-adjacent verdict. A confident first sample skips resampling entirely to avoid paying for it on the common case.
+
+**Output:** `{ "source": "ai_judge", "judge_confidence": 0.88, "claim_verdict": "SUPPORTED", "method": "llm" | "heuristic", "fallback_reason": null | "timeout" | "malformed_response" | "provider_error", "self_graded": false, "samples_used": 1 }`
 
 ### 6. Injection in Response
-**Method:** Keyword scanning of LLM response for signs the model was successfully jailbroken (e.g., "As DAN...", "I will now ignore...", "Here is my system prompt...")
-**Output:** `{ "source": "injection", "injection_score": 0.0 }`
+**Model:** Regex pattern families (`injection_patterns.py`) fused with `protectai/deberta-v3-base-prompt-injection-v2` (loaded in a background thread at startup, same convention as the bias classifier — never blocks a request, falls back to regex-only until ready).
+**Method:** Scans the LLM response for signs the model was successfully jailbroken (e.g., "As DAN...", "I will now ignore...", "Here is my system prompt...") via the named regex families, plus an independent classifier score; the two are combined via `max()`, not averaged, so either detector alone can surface a risk the other misses. Skipped on the `realtime` latency tier, where only the (effectively free) regex scan runs.
+**Output:** `{ "source": "injection", "injection_score": 0.0, "categories": [], "ml_injection_score": null, "ml_used": false }`
+
+**Note:** The same fused scoring also runs on the *input* side in `node_security`, plus a cross-turn variant (`score_injection_session`) that concatenates recent session turns to catch a phrase split across messages — see `docs/threat-model.md` §1.
 
 ### 7. Session Consistency
 **Method:** Checks cumulative session risk level against tier thresholds.
@@ -119,6 +128,16 @@ Different use-cases have different `review_threshold` values:
 - Stricter review threshold (−0.05)
 
 ---
+
+## AI-Judge Calibration Harness
+
+`scripts/calibrate_judge.py` runs `AIJudge` against a golden dataset (`backend/app/evaluation/golden_dataset.py`) and reports verdict accuracy, per-class precision/recall/f1, bias-flag accuracy, and whether `judge_confidence` actually tracks correctness (mean confidence on correct vs. incorrect predictions — if incorrect predictions score *higher* on average, confidence isn't trustworthy yet).
+
+**The golden dataset is a small synthetic starter set**, not human-reviewed production data — see its module docstring. Running it against the current heuristic fallback path already surfaced a real gap worth knowing about: **verdict accuracy is 40% (4/10)**, because `_assess_claim_verifiability`'s keyword-count bucketing (`backend/app/evaluation/ai_judge.py`) requires 2+ indicator hits out of 5 to move off `SUPPORTED`, so a response with exactly one strong signal (e.g. a single fabricated statistic) still gets waved through. Bias-flag accuracy and confidence calibration were both sound (1.0 accuracy, confidence correctly higher on correct predictions) — the gap is specifically in claim verifiability, not the judge's other checks. This heuristic weakness was already known to be crude (see `ai_judge.py`'s own docstring); the harness now makes it *measured* rather than assumed. Before trusting `judge_confidence` to gate real decisions in production, extend the golden dataset with real human-reviewed examples and re-run.
+
+```
+python scripts/calibrate_judge.py
+```
 
 ## Auto-Threshold Tuner
 

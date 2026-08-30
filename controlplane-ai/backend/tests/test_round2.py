@@ -5,10 +5,12 @@ from backend.app.workflows.graph import app_graph
 from backend.app.evaluation.evidence_fusion import evidence_fusion
 from backend.app.evaluation.retrieval_verifier import retrieval_verifier
 from backend.app.evaluation.action_gate import action_gate
-from backend.app.evaluation.threshold_tuner import threshold_tuner, ThresholdTuner
+from backend.app.evaluation.threshold_tuner import threshold_tuner
 from backend.app.policies.registry import policy_registry
 from backend.app.session.context import SessionStore
 from backend.app.schemas.chat import VerificationStatus
+from backend.app.db.database import Base, engine, AsyncSessionLocal
+from backend.app.db.models import AuditLog
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -122,9 +124,10 @@ async def test_human_reject_terminates():
 
 # ── Test 7: Session risk escalation ───────────────────────────────────────────
 
-def test_session_risk_escalation():
+@pytest.mark.asyncio
+async def test_session_risk_escalation():
     store = SessionStore()
-    session = store.get_or_create("test-session-escalation", "internal_copilot")
+    session = await store.get_or_create("test-session-escalation", "internal_copilot")
 
     session.add_turn("p1", "r1", risk_delta=12)
     assert session.escalation_level == "normal"
@@ -160,19 +163,39 @@ def test_agent_read_allowed():
 
 # ── Test 10: Threshold recommendation — NOT auto-applied ──────────────────────
 
-def test_threshold_recommendation_not_auto_applied():
-    tuner = ThresholdTuner()
-    # Simulate 40 reviews where human overrode (FP)
-    for _ in range(40):
-        tuner.record_feedback("customer_support", "REVIEW", "approve")
-    for _ in range(10):
-        tuner.record_feedback("customer_support", "REVIEW", "reject")
+@pytest.mark.asyncio
+async def test_threshold_recommendation_not_auto_applied():
+    """ThresholdTuner now reads FP rate from real AuditLog human-review
+    outcomes (human_review_required/human_override/human_override_decision)
+    instead of a synthetic in-memory feedback store — seed rows for a
+    throwaway use_case (unique per run since AuditLog is now a persistent
+    table, not reset between test processes) directly."""
+    Base.metadata.create_all(bind=engine)
+    use_case = f"test-use-case-{uuid.uuid4().hex[:10]}"
 
-    rec = tuner.generate_recommendation("customer_support", 80.0)
+    async with AsyncSessionLocal() as db:
+        # 40 REVIEW-flagged rows the human approved anyway (false positives)
+        for _ in range(40):
+            db.add(AuditLog(
+                id=str(uuid.uuid4()), use_case=use_case, decision="REVIEW",
+                human_review_required=True, human_override=True, human_override_decision="approve",
+            ))
+        # 10 the human actually rejected (true positives)
+        for _ in range(10):
+            db.add(AuditLog(
+                id=str(uuid.uuid4()), use_case=use_case, decision="REVIEW",
+                human_review_required=True, human_override=True, human_override_decision="reject",
+            ))
+        await db.commit()
+
+        rec = await threshold_tuner.generate_recommendation(db, use_case, 80.0)
+
     assert rec is not None
     assert rec["status"] == "awaiting_admin_approval"
     assert rec["recommended_threshold"] < 80.0
-    # Verify the current threshold was NOT changed
+    # Verify the real customer_support policy threshold was NOT changed —
+    # generate_recommendation only persists a recommendation row, it never
+    # touches PolicyRegistry.
     policy = policy_registry.get_policy("customer_support", "global")
     assert policy.review_threshold == 75  # Original unchanged
 

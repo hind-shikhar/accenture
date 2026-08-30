@@ -91,3 +91,30 @@ def score_injection(text: str) -> "tuple[float, list[str]]":
     if rule_hits == 1:
         return 0.4, sorted(matched_categories)
     return min(0.9 + 0.05 * (rule_hits - 2), 1.0), sorted(matched_categories)
+
+
+def score_injection_session(current_prompt: str, recent_prompts: "list[str]") -> "tuple[float, list[str]]":
+    """
+    Cross-turn variant of score_injection, for catching instruction
+    smuggling split across multiple messages (e.g. "...ignore all" in one
+    turn, "previous instructions..." in the next) that per-message scoring
+    can't see, since neither message alone contains the full phrase.
+
+    Concatenates recent_prompts (oldest first) with current_prompt and
+    re-scores the combined text. Only returns non-zero when the combined
+    text matches a pattern CATEGORY that current_prompt alone does not —
+    that isolates the genuinely cross-turn finding from simply re-detecting
+    whatever the single-message scan already caught (which node_security
+    already scores and would otherwise be double-counted here).
+    """
+    if not recent_prompts:
+        return 0.0, []
+
+    combined = " ".join([*recent_prompts, current_prompt])
+    combined_score, combined_categories = score_injection(combined)
+    _, solo_categories = score_injection(current_prompt)
+
+    new_categories = [c for c in combined_categories if c not in solo_categories]
+    if not new_categories:
+        return 0.0, []
+    return combined_score, new_categories

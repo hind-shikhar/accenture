@@ -24,6 +24,10 @@ MODEL_MAP = {
     "mock-fast": os.getenv("FAST_MODEL", "gpt-4o-mini"),
     "mock-smart": os.getenv("SMART_MODEL", "gpt-4o"),
     "mock-secure": os.getenv("SECURE_MODEL", "gpt-4o-mini"),
+    # Deliberately defaults to a different model than mock-smart: the
+    # AI-Judge (backend/app/evaluation/ai_judge.py) must not grade the same
+    # model's own output when the router picks the smart tier for generation.
+    "mock-judge": os.getenv("JUDGE_MODEL", "gpt-4o-mini"),
 }
 
 
@@ -32,14 +36,20 @@ class LiteLLMProvider(ModelProvider):
 
     async def generate(self, prompt: str, model: str, **kwargs) -> Dict[str, Any]:
         real_model = MODEL_MAP.get(model, model)
-        response = await litellm.acompletion(
+        completion_kwargs: Dict[str, Any] = dict(
             model=real_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=kwargs.get("max_tokens", 800),
+            max_tokens=kwargs.get("max_tokens", 2048),
             temperature=kwargs.get("temperature", 0.2),
             num_retries=0,
-            timeout=kwargs.get("timeout", 15),
+            timeout=kwargs.get("timeout", 60),
         )
+        # Only passed through when the caller explicitly requests it (e.g.
+        # AIJudge asking for JSON-mode output) — not every model LiteLLM
+        # routes to accepts response_format, so this is opt-in per call.
+        if kwargs.get("response_format"):
+            completion_kwargs["response_format"] = kwargs["response_format"]
+        response = await litellm.acompletion(**completion_kwargs)
         text = response.choices[0].message.content or ""
         usage = getattr(response, "usage", None)
         return {

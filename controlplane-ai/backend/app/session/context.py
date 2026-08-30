@@ -1,17 +1,31 @@
 from typing import Dict, List, Optional, Any
+import json
+import os
 import time
 import structlog
 
 logger = structlog.get_logger()
 
+try:
+    import redis.asyncio as aioredis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
 
 class SessionTurn:
-    def __init__(self, turn_number: int, prompt: str, response: str, risk_delta: float):
+    def __init__(self, turn_number: int, prompt: str, response: str, risk_delta: float, timestamp: Optional[float] = None):
         self.turn_number = turn_number
         self.prompt = prompt
         self.response = response
         self.risk_delta = risk_delta
-        self.timestamp = time.time()
+        self.timestamp = timestamp if timestamp is not None else time.time()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "turn_number": self.turn_number, "prompt": self.prompt, "response": self.response,
+            "risk_delta": self.risk_delta, "timestamp": self.timestamp,
+        }
 
 
 DEFAULT_ESCALATION_THRESHOLDS = {"normal": 40, "judge_required": 80, "review_forced": 120}
@@ -61,29 +75,111 @@ class SessionContext:
     def turn_count(self) -> int:
         return len(self.turns)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialization for the Redis-backed store below."""
+        return {
+            "session_id": self.session_id,
+            "use_case": self.use_case,
+            "cumulative_risk": self.cumulative_risk,
+            "escalation_level": self.escalation_level,
+            "escalation_thresholds": self.escalation_thresholds,
+            "turns": [t.to_dict() for t in self.turns],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SessionContext":
+        ctx = cls(data["session_id"], data["use_case"], data.get("escalation_thresholds"))
+        ctx.cumulative_risk = data.get("cumulative_risk", 0.0)
+        ctx.escalation_level = data.get("escalation_level", "normal")
+        ctx.turns = [SessionTurn(**t) for t in data.get("turns", [])]
+        return ctx
+
+
+# How long a session survives with no new turns, when Redis-backed. Bounds
+# unbounded memory/key growth for abandoned sessions instead of keeping them
+# forever. Irrelevant to the in-memory fallback (which never persists past
+# process exit anyway).
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60 * 24)))
+
 
 class SessionStore:
-    """In-memory session store. In production, back with Redis."""
+    """
+    Session / HITL-escalation state store.
+
+    Backed by Redis when REDIS_URL is set and the `redis` package is
+    installed (requirements-optional.txt) — required for a multi-instance
+    deployment, since session state living only in one process's dict means
+    a second replica, or a restart, silently resets every in-flight
+    session's cumulative risk and escalation level. Falls back to the
+    original in-process dict otherwise (the default/demo configuration),
+    with identical behavior to before this class supported Redis at all.
+
+    get/get_or_create/get_drift_score are async regardless of which backend
+    is active, so callers don't need to know or care which one is in play.
+    """
 
     def __init__(self):
         self._sessions: Dict[str, SessionContext] = {}
+        self._redis = None
+        redis_url = os.getenv("REDIS_URL")
+        if redis_url and REDIS_AVAILABLE:
+            try:
+                self._redis = aioredis.from_url(redis_url, decode_responses=True)
+                logger.info("session_store_redis_configured")
+            except Exception as e:
+                logger.warning("session_store_redis_init_failed", error=str(e), fallback="in-memory")
+        elif redis_url and not REDIS_AVAILABLE:
+            logger.warning("session_store_redis_url_set_but_package_missing",
+                            detail="pip install redis — falling back to in-memory session store")
 
-    def get_or_create(
+    def _redis_key(self, session_id: str) -> str:
+        return f"controlplane:session:{session_id}"
+
+    async def get_or_create(
         self,
         session_id: str,
         use_case: str = "internal_copilot",
         escalation_thresholds: Optional[Dict[str, int]] = None
     ) -> SessionContext:
-        if session_id not in self._sessions:
-            self._sessions[session_id] = SessionContext(session_id, use_case, escalation_thresholds)
-        return self._sessions[session_id]
+        existing = await self.get(session_id)
+        if existing:
+            return existing
+        ctx = SessionContext(session_id, use_case, escalation_thresholds)
+        self._sessions[session_id] = ctx
+        return ctx
 
-    def get(self, session_id: str) -> Optional[SessionContext]:
-        return self._sessions.get(session_id)
+    async def get(self, session_id: str) -> Optional[SessionContext]:
+        if session_id in self._sessions:
+            return self._sessions[session_id]
+        if self._redis:
+            try:
+                raw = await self._redis.get(self._redis_key(session_id))
+                if raw:
+                    ctx = SessionContext.from_dict(json.loads(raw))
+                    self._sessions[session_id] = ctx
+                    return ctx
+            except Exception as e:
+                logger.warning("session_store_redis_read_failed", session_id=session_id, error=str(e))
+        return None
 
-    def get_drift_score(self, session_id: str) -> float:
+    async def commit(self, session: SessionContext):
+        """Persist a session mutated in place (e.g. after add_turn()). No-op
+        against Redis when it isn't configured — the in-memory dict already
+        holds the same object reference, so it's already current."""
+        self._sessions[session.session_id] = session
+        if self._redis:
+            try:
+                await self._redis.set(
+                    self._redis_key(session.session_id),
+                    json.dumps(session.to_dict()),
+                    ex=SESSION_TTL_SECONDS,
+                )
+            except Exception as e:
+                logger.warning("session_store_redis_write_failed", session_id=session.session_id, error=str(e))
+
+    async def get_drift_score(self, session_id: str) -> float:
         """Returns how much the session risk has drifted from baseline."""
-        session = self.get(session_id)
+        session = await self.get(session_id)
         if not session:
             return 0.0
         if len(session.turns) < 2:

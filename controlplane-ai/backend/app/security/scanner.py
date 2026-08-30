@@ -54,10 +54,17 @@ class SecurityScanner:
         pii_types: Set[str] = set()
         masked = text
         if results:
+            # Only flag actual sensitive PII, ignore generic DATE_TIME, LOCATION, or NRP
+            # We also removed US_DRIVER_LICENSE because Presidio falsely flags "Q3" as one!
+            sensitive_entities = {"PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "US_SSN"}
             for r in results:
-                pii_types.add(r.entity_type)
-            anon = self.anonymizer.anonymize(text=text, analyzer_results=results)
-            masked = anon.text
+                if r.entity_type in sensitive_entities:
+                    pii_types.add(r.entity_type)
+            # We only want to anonymize the sensitive entities, so we need to filter results passed to anonymizer
+            filtered_results = [r for r in results if r.entity_type in sensitive_entities]
+            if filtered_results:
+                anon = self.anonymizer.anonymize(text=text, analyzer_results=filtered_results)
+                masked = anon.text
         return masked, pii_types
 
     # ── Public async interface ──────────────────────────────────────────────────

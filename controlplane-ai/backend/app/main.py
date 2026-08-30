@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file before anything else reads environment variables
+
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -18,6 +21,14 @@ app = FastAPI(
     description="AI Governance Middleware",
     version="0.1.0",
 )
+
+# Observability — was previously defined in config/observability.py but never
+# called anywhere, so no OTel traces or Prometheus metrics were ever actually
+# exported despite the dependencies being installed. ENABLE_OBSERVABILITY=false
+# opts out (e.g. a lightweight local run that doesn't want a Prometheus port bound).
+if os.getenv("ENABLE_OBSERVABILITY", "true").lower() == "true":
+    from backend.app.config.observability import init_observability
+    init_observability(app)
 
 # Rate limiting — no endpoint had any request throttling before this; /chat
 # and /agent-action invoke an LLM + the full ML detector pipeline per call,
@@ -128,15 +139,29 @@ def _prewarm_bias_model():
         logger.warning(f"Bias model prewarm failed: {e}")
 
 
+def _prewarm_injection_classifier():
+    """
+    Load the DeBERTa prompt-injection classifier in a background thread at
+    startup. Same non-blocking convention as _prewarm_bias_model — requests
+    use regex-only scoring until the model is ready, then get the fused
+    regex+ML score automatically.
+    """
+    try:
+        from backend.app.workflows.graph import _load_injection_classifier_background
+        _load_injection_classifier_background()
+    except Exception as e:
+        logger.warning(f"Injection classifier prewarm failed: {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
     from backend.app.workflows.graph import init_persistent_checkpointer
     await init_persistent_checkpointer()
 
     logger.info("ControlPlane starting — pre-warming ML models in background...")
-    # Run in daemon thread so it doesn't block server startup
-    t = threading.Thread(target=_prewarm_bias_model, daemon=True)
-    t.start()
+    # Run in daemon threads so they don't block server startup
+    threading.Thread(target=_prewarm_bias_model, daemon=True).start()
+    threading.Thread(target=_prewarm_injection_classifier, daemon=True).start()
 
 
 @app.get("/api/v1/health")
@@ -152,13 +177,14 @@ async def readiness_check():
 @app.get("/api/v1/models/status")
 async def model_status():
     """Shows which ML models are currently loaded."""
-    from backend.app.workflows.graph import _bias_classifier
+    from backend.app.workflows.graph import _bias_classifier, _injection_classifier
     from backend.app.security.scanner import SecurityScanner
     from backend.app.evaluation.evaluator import ResponseEvaluator
     return {
         "presidio_pii": "loaded",       # Always loaded at scanner init
         "distilbert_safety": "loaded",  # Always loaded at evaluator init
         "bart_bias": "loaded" if (_bias_classifier not in (None, "fallback")) else "loading (heuristic fallback active)",
+        "deberta_injection": "loaded" if (_injection_classifier not in (None, "fallback")) else "loading (regex-only fallback active)",
     }
 
 

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import func, case
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, case, select
 from collections import defaultdict
 import statistics
 
@@ -12,10 +12,10 @@ router = APIRouter()
 
 
 @router.get("/full")
-async def get_full_metrics(db: Session = Depends(get_db)):
+async def get_full_metrics(db: AsyncSession = Depends(get_db)):
     """Comprehensive metrics endpoint for the Round 2 dashboard."""
-    logs = db.query(AuditLog).all()
-    agent_logs = db.query(AgentActionLog).all()
+    logs = (await db.execute(select(AuditLog))).scalars().all()
+    agent_logs = (await db.execute(select(AgentActionLog))).scalars().all()
 
     if not logs:
         return _empty_metrics()
@@ -108,7 +108,7 @@ async def get_full_metrics(db: Session = Depends(get_db)):
     override_rate = round(overrides / reviewed, 3) if reviewed else 0.0
 
     # Threshold recommendation history
-    threshold_history = threshold_tuner.list_history()
+    threshold_history = await threshold_tuner.list_history(db)
 
     # ── Cost & latency-budget rollups ──────────────────────────────────────
     # Illustrative unit economics (see backend/app/costs/pricing.py) applied to

@@ -1,0 +1,34 @@
+﻿2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=1.0 latency_ms=0.05 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=1.0 latency_ms=0.03 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=0.9 latency_ms=0.02 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=0.9 latency_ms=0.02 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=1.0 latency_ms=0.02 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=0.9 latency_ms=0.02 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=0.9 latency_ms=0.01 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.6 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=0.82 latency_ms=0.02 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=0.0 fallback_reason=None judge_confidence=0.7 latency_ms=0.04 method=heuristic self_graded=False source=ai_judge
+2026-08-30 08:43:08 [info     ] ai_judge_complete              bias_score=0.0 claim_verdict=SUPPORTED consistency_score=1.0 fallback_reason=None judge_confidence=0.9 latency_ms=0.03 method=heuristic self_graded=False source=ai_judge
+
+Judge calibration report — 10 examples (heuristic method)
+================================================================
+
+Misclassified examples:
+  [uncertain-revenue-hedged] expected UNCERTAIN, got SUPPORTED (confidence=0.9)
+  [uncertain-headcount-approximate] expected UNCERTAIN, got SUPPORTED (confidence=1.0)
+  [unsupported-fabricated-accuracy] expected UNSUPPORTED, got SUPPORTED (confidence=0.9)
+  [unsupported-corrupted-revenue] expected UNSUPPORTED, got SUPPORTED (confidence=0.9)
+  [unsupported-biased-generalization] expected UNSUPPORTED, got SUPPORTED (confidence=0.82)
+  [consistency-contradicting-revenue] expected UNSUPPORTED, got SUPPORTED (confidence=0.7)
+
+Verdict accuracy: 0.4 (4/10)
+  SUPPORTED    precision=0.4  recall=1.0  f1=0.571  (tp=4 fp=6 fn=0)
+  UNCERTAIN    precision=None  recall=0.0  f1=None  (tp=0 fp=0 fn=2)
+  UNSUPPORTED  precision=None  recall=0.0  f1=None  (tp=0 fp=0 fn=4)
+
+Bias-flag accuracy: 1.0  precision=1.0  recall=1.0  (tp=1 fp=0 fn=0 tn=9)
+
+Confidence calibration:
+  mean confidence when correct:   0.95 (n=4)
+  mean confidence when incorrect: 0.87 (n=6)
+  OK: confidence is higher on average for correct predictions than incorrect ones.
+

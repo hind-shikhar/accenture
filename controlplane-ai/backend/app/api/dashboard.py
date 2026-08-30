@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, select
 from typing import List, Optional
 import uuid, csv, io
 from datetime import datetime, timezone
@@ -18,20 +18,30 @@ router = APIRouter()
 
 
 @router.get("/metrics")
-async def get_metrics(db: Session = Depends(get_db)):
-    total = db.query(func.count(AuditLog.id)).scalar() or 0
-    escalated = db.query(func.count(AuditLog.id)).filter(AuditLog.human_review_required == True).scalar() or 0
-    avg_trust = db.query(func.avg(AuditLog.trust_score)).scalar() or 0.0
-    sanitized = db.query(func.count(AuditLog.id)).filter(AuditLog.decision == "SANITIZE").scalar() or 0
-    blocked = db.query(func.count(AuditLog.id)).filter(AuditLog.decision == "BLOCK").scalar() or 0
-    allowed = db.query(func.count(AuditLog.id)).filter(AuditLog.decision == "ALLOW").scalar() or 0
+async def get_metrics(db: AsyncSession = Depends(get_db)):
+    total = (await db.execute(select(func.count(AuditLog.id)))).scalar() or 0
+    escalated = (await db.execute(
+        select(func.count(AuditLog.id)).where(AuditLog.human_review_required == True)
+    )).scalar() or 0
+    avg_trust = (await db.execute(select(func.avg(AuditLog.trust_score)))).scalar() or 0.0
+    sanitized = (await db.execute(
+        select(func.count(AuditLog.id)).where(AuditLog.decision == "SANITIZE")
+    )).scalar() or 0
+    blocked = (await db.execute(
+        select(func.count(AuditLog.id)).where(AuditLog.decision == "BLOCK")
+    )).scalar() or 0
+    allowed = (await db.execute(
+        select(func.count(AuditLog.id)).where(AuditLog.decision == "ALLOW")
+    )).scalar() or 0
 
     # Compute FP rate (human approved what system escalated)
-    overrides = db.query(func.count(AuditLog.id)).filter(
-        AuditLog.human_review_required == True,
-        AuditLog.human_override == True,
-        AuditLog.human_override_decision == "approve"
-    ).scalar() or 0
+    overrides = (await db.execute(
+        select(func.count(AuditLog.id)).where(
+            AuditLog.human_review_required == True,
+            AuditLog.human_override == True,
+            AuditLog.human_override_decision == "approve"
+        )
+    )).scalar() or 0
     fp_rate = round(overrides / escalated, 3) if escalated > 0 else 0.0
 
     return {
@@ -59,37 +69,39 @@ from fastapi import APIRouter, Depends, HTTPException, Header
 def require_reviewer(x_user_role: str = Header("Viewer")):
     if x_user_role not in ["Admin", "Reviewer"]:
         raise HTTPException(status_code=403, detail="RBAC: Only Reviewers or Admins can perform this action.")
+    return x_user_role
 
 def require_admin(x_user_role: str = Header("Viewer")):
     if x_user_role != "Admin":
         raise HTTPException(status_code=403, detail="RBAC: Only Admins can modify policy thresholds.")
+    return x_user_role
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/reviews")
-async def get_pending_reviews(db: Session = Depends(get_db)):
-    reviews = db.query(AuditLog).filter(AuditLog.human_review_status == "pending").all()
-    return reviews
+async def get_pending_reviews(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(AuditLog).where(AuditLog.human_review_status == "pending"))
+    return result.scalars().all()
 
 
 @router.post("/review/{log_id}")
 async def submit_review(
-    log_id: str, 
-    action: str, 
-    edited_text: str = None, 
-    db: Session = Depends(get_db),
+    log_id: str,
+    action: str,
+    edited_text: str = None,
+    db: AsyncSession = Depends(get_db),
     role: str = Depends(require_reviewer)
 ):
-    log = db.query(AuditLog).filter(AuditLog.id == log_id).first()
+    log = (await db.execute(select(AuditLog).where(AuditLog.id == log_id))).scalar_one_or_none()
     if not log:
         raise HTTPException(status_code=404, detail="Review not found")
-        
+
     if log.human_review_status != "pending":
         raise HTTPException(status_code=400, detail="This request has already been reviewed by another admin.")
 
     valid_actions = ["approve", "reject", "edit", "regenerate", "approved", "rejected"]
     if action not in valid_actions:
         raise HTTPException(status_code=400, detail="Invalid action")
-        
+
     if action == "edit" and not edited_text:
         raise HTTPException(status_code=400, detail="Edited text cannot be empty.")
 
@@ -103,32 +115,31 @@ async def submit_review(
         resume_payload = {"action": action, "text": edited_text}
         await app_graph.ainvoke(Command(resume=resume_payload), config=config)
 
-    # Record feedback for threshold tuner
+    # This AuditLog row (human_review_required / human_override /
+    # human_override_decision) IS the feedback record the threshold tuner
+    # reads from (see evaluation/threshold_tuner.py's compute_fp_rate) — no
+    # separate in-memory feedback store to keep in sync.
     human_outcome = "approve" if action in ("approve", "edit") else "reject"
-    threshold_tuner.record_feedback(
-        use_case=log.use_case or "internal_copilot",
-        auto_decision="REVIEW",
-        human_decision=human_outcome
-    )
 
     log.human_review_status = action if action in ("approve", "reject") else "resolved"
     log.human_override = True
     log.human_override_decision = human_outcome
-    db.commit()
+    await db.commit()
 
     return {"status": "success", "action": action, "log_id": log_id}
 
 
 @router.get("/audit")
-async def get_audit_logs(db: Session = Depends(get_db)):
-    logs = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(50).all()
-    return logs
+async def get_audit_logs(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(AuditLog).order_by(AuditLog.timestamp.desc()).limit(50))
+    return result.scalars().all()
 
 
 @router.get("/audit/export")
-async def export_audit_csv(db: Session = Depends(get_db)):
+async def export_audit_csv(db: AsyncSession = Depends(get_db)):
     """Download all audit logs as a CSV file."""
-    logs = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).all()
+    result = await db.execute(select(AuditLog).order_by(AuditLog.timestamp.desc()))
+    logs = result.scalars().all()
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -169,40 +180,40 @@ async def export_audit_csv(db: Session = Depends(get_db)):
 # ── Threshold Recommendations ───────────────────────────────────────────────
 
 @router.get("/thresholds/recommendations")
-async def list_recommendations():
-    return threshold_tuner.list_pending()
+async def list_recommendations(db: AsyncSession = Depends(get_db)):
+    return await threshold_tuner.list_pending(db)
 
 
 @router.get("/thresholds/history")
-async def recommendation_history():
-    return threshold_tuner.list_history()
+async def recommendation_history(db: AsyncSession = Depends(get_db)):
+    return await threshold_tuner.list_history(db)
 
 
 @router.post("/thresholds/{rec_id}/approve")
-async def approve_recommendation(rec_id: str, role: str = Depends(require_admin)):
-    rec = threshold_tuner.approve_recommendation(rec_id, admin_id=role)
+async def approve_recommendation(rec_id: str, db: AsyncSession = Depends(get_db), role: str = Depends(require_admin)):
+    rec = await threshold_tuner.approve_recommendation(db, rec_id, admin_id=role)
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found or already resolved")
-    
+
     # Update the actual policy threshold dynamically so future prompts use it
     policy_registry.update_threshold(rec["use_case"], "global", rec["recommended_threshold"])
-    
+
     return {"status": "approved", "recommendation": rec}
 
 
 @router.post("/thresholds/{rec_id}/reject")
-async def reject_recommendation(rec_id: str, role: str = Depends(require_admin)):
-    rec = threshold_tuner.reject_recommendation(rec_id, admin_id=role)
+async def reject_recommendation(rec_id: str, db: AsyncSession = Depends(get_db), role: str = Depends(require_admin)):
+    rec = await threshold_tuner.reject_recommendation(db, rec_id, admin_id=role)
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found or already resolved")
     return {"status": "rejected", "recommendation": rec}
 
 
 @router.post("/thresholds/analyze/{use_case}")
-async def analyze_thresholds(use_case: str, db: Session = Depends(get_db)):
+async def analyze_thresholds(use_case: str, db: AsyncSession = Depends(get_db)):
     """Trigger FP/FN analysis and generate recommendation if warranted."""
     policy = policy_registry.get_policy(use_case)
-    rec = threshold_tuner.generate_recommendation(use_case, policy.review_threshold)
+    rec = await threshold_tuner.generate_recommendation(db, use_case, policy.review_threshold)
     if not rec:
         return {"message": "No recommendation needed — FP/FN rates are within acceptable range."}
     return rec

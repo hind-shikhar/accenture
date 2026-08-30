@@ -61,7 +61,17 @@ class EvidenceFusion:
 
         injection_risk = input_pii_ev.get("prompt_injection_score", injection_ev.get("injection_score", 0.0))
         hallucination_risk = 1.0 - hallucination_ev.get("factuality_score", 1.0)
-        bias_risk = judge_ev.get("bias_score", bias_ev.get("bias_score", 0.0))
+        # max(), not judge_ev.get(key, fallback) — the AI-Judge's evidence
+        # ALWAYS includes a "bias_score" key, even when it's skipped for a
+        # fresh session (bias_score hardcoded to 0.0, see node_ai_judge in
+        # workflows/graph.py). A .get(key, fallback) only uses the fallback
+        # when the key is entirely ABSENT, so that fallback to the dedicated
+        # bias detector's real score was unreachable — node_detect_bias's
+        # BART/heuristic finding was silently discarded whenever the judge
+        # ran (or was skipped), regardless of what it found. Same
+        # defense-in-depth fusion convention as _ml_injection_score elsewhere
+        # in this pipeline: neither detector is trusted as the sole signal.
+        bias_risk = max(judge_ev.get("bias_score", 0.0), bias_ev.get("bias_score", 0.0))
         retrieval_risk = 0.5 if retrieval_ev.get("verification_status") == "UNVERIFIED" else (
             0.9 if retrieval_ev.get("verification_status") == "CONTRADICTED" else 0.0
         )
