@@ -11,7 +11,7 @@
 
 - [What is ControlPlane.ai?](#what-is-controlplaneai)
 - [Implementation Approach](#implementation-approach)
-- [Round 2 Architecture](#round-2-architecture)
+- [Architecture](#round-2-architecture)
 - [Key Features](#key-features)
 - [Use Cases Demonstrated](#use-cases-demonstrated)
 - [Dependencies](#dependencies)
