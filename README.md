@@ -297,9 +297,9 @@ ControlPlane.ai is designed to scale with enterprise needs. Round 2 already repl
 
 ## Further Documentation
 
-- [`docs/architecture.md`](docs/architecture.md) — full pipeline breakdown, LangGraph flow diagram, request lifecycle, database schema
-- [`docs/evaluation.md`](docs/evaluation.md) — the 7-detector evidence fusion algorithm, trust score math, decision waterfall, threshold-tuning logic
-- [`docs/threat-model.md`](docs/threat-model.md) — threat categories, mitigations, and known residual risks (including the demo-only auth stub)
-- [`docs/demo.md`](docs/demo.md) — the judge walkthrough script used to record the demo video above
-- [`docs/api.md`](docs/api.md) — API reference
-- [`docs/developer-guide.md`](docs/developer-guide.md) — developer setup and contribution notes
+- [`controlplane-ai/docs/architecture.md`](docs/architecture.md) — full pipeline breakdown, LangGraph flow diagram, request lifecycle, database schema
+- [`controlplane-ai/docs/evaluation.md`](docs/evaluation.md) — the 7-detector evidence fusion algorithm, trust score math, decision waterfall, threshold-tuning logic
+- [`controlplane-ai/docs/threat-model.md`](docs/threat-model.md) — threat categories, mitigations, and known residual risks (including the demo-only auth stub)
+- [`controlplane-ai/docs/demo.md`](docs/demo.md) — the judge walkthrough script used to record the demo video above
+- [`controlplane-ai/docs/api.md`](docs/api.md) — API reference
+- [`controlplane-ai/docs/developer-guide.md`](docs/developer-guide.md) — developer setup and contribution notes
